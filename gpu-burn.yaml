@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpuburn-job
+spec:
+  template:
+    metadata:
+      name: gpuburn-job
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: gpuburn
+        image: iankoulski/gpuburn
+        # Env variable to define how long gpu_burn will run
+        env:
+        - name: GPUBURN_TIME
+          value: "60" # Adjust as needed
+
+        # Use a shell so that the environment variable is expanded
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Running gpu_burn for $GPUBURN_TIME seconds..."
+          # find flags at https://github.com/wilicc/gpu-burn
+          /app/gpu_burn $GPUBURN_TIME
