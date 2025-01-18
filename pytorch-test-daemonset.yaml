@@ -1,0 +1,425 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-benchmark-daemonset
+  labels:
+    app: gpu-benchmark
+spec:
+  selector:
+    matchLabels:
+      app: gpu-benchmark
+  template:
+    metadata:
+      labels:
+        app: gpu-benchmark
+    spec:
+      restartPolicy: Always  # DaemonSet requires restartPolicy to be Always
+      containers:
+        - name: gpu-benchmark-container
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e  # Exit immediately if a command exits with a non-zero status
+              
+              # Create the GPU benchmark script
+              cat << 'EOF' > /tmp/gpu_benchmark.py
+              import os
+              import sys
+              import platform
+              import subprocess
+              import time
+              import csv
+              import math
+              from datetime import datetime
+              import torch
+              import torch.nn as nn
+              import torch.optim as optim
+
+              def print_kubernetes_info():
+                  print("=== Kubernetes & Environment Variables ===")
+                  node_name = os.environ.get('NODE_NAME', 'unknown')
+                  pod_name = os.environ.get('POD_NAME', 'unknown')
+                  pod_namespace = os.environ.get('POD_NAMESPACE', 'unknown')
+                  pod_ip = os.environ.get('POD_IP', 'unknown')
+                  host_ip = os.environ.get('HOST_IP', 'unknown')
+                  hostname = os.environ.get('HOSTNAME', 'unknown')
+                  print(f"Node Name:       {node_name}")
+                  print(f"Pod Name:        {pod_name}")
+                  print(f"Pod Namespace:   {pod_namespace}")
+                  print(f"Pod IP:          {pod_ip}")
+                  print(f"Host IP:         {host_ip}")
+                  print(f"Container Hostname (HOSTNAME): {hostname}")
+                  print(f"TEST_SIZE:       {os.environ.get('TEST_SIZE', 'not set')}")
+                  print("==========================================\n")
+
+              def print_system_info():
+                  print("=== System & Environment Information ===")
+                  print(f"Platform:           {platform.platform()}")
+                  print(f"Python Version:     {sys.version.splitlines()[0]}")
+                  print(f"PyTorch Version:    {torch.__version__}")
+                  cuda_available = torch.cuda.is_available()
+                  print(f"CUDA Available:     {cuda_available}")
+                  if cuda_available:
+                      print(f"CUDA Version:       {torch.version.cuda}")
+                  else:
+                      print("CUDA Version:       Not available (CUDA not detected).")
+                  if hasattr(torch.backends, 'cudnn'):
+                      print(f"cuDNN Enabled:      {torch.backends.cudnn.enabled}")
+                      print(f"cuDNN Version:      {torch.backends.cudnn.version()}")
+                  else:
+                      print("cuDNN:              Not available in this PyTorch build.")
+                  print("========================================\n")
+
+              def check_nvidia_smi():
+                  print("=== Checking NVIDIA System Management Interface (nvidia-smi) ===")
+                  try:
+                      smi_output = subprocess.check_output(
+                          ["nvidia-smi","--query-gpu=driver_version,name,memory.total","--format=csv,noheader,nounits"],
+                          stderr=subprocess.STDOUT
+                      ).decode("utf-8").strip()
+                      if not smi_output:
+                          print("nvidia-smi returned no output. Something may be off.")
+                          return
+                      lines = smi_output.split("\n")
+                      for idx, line in enumerate(lines):
+                          driver_version, gpu_name, mem_total = [item.strip() for item in line.split(",")]
+                          if idx == 0:
+                              print(f"Driver Version: {driver_version}")
+                          print(f"GPU {idx}:")
+                          print(f"  - Name:       {gpu_name}")
+                          print(f"  - Total Mem:  {mem_total} MB")
+                  except FileNotFoundError:
+                      print("nvidia-smi not found in PATH. Ensure the NVIDIA driver is installed.")
+                  except subprocess.CalledProcessError as e:
+                      print(f"Error calling nvidia-smi: {e.output.decode('utf-8')}")
+                  except Exception as e:
+                      print(f"An unexpected error occurred while running nvidia-smi: {e}")
+                  print("===============================================================\n")
+
+              def check_gpus():
+                  available_gpus = []
+                  unavailable_gpus = []
+                  print("Checking GPU availability and basic functionality...")
+                  if not torch.cuda.is_available():
+                      print("No GPU or CUDA not properly configured!")
+                      return available_gpus, unavailable_gpus
+                  try:
+                      num_gpus = torch.cuda.device_count()
+                      print(f"Number of GPUs detected: {num_gpus}")
+                  except RuntimeError as e:
+                      print(f"CUDA Runtime Error: {e}")
+                      return available_gpus, unavailable_gpus
+                  for i in range(num_gpus):
+                      device_name = torch.cuda.get_device_name(i)
+                      print(f"\nGPU {i}: {device_name}")
+                      try:
+                          with torch.cuda.device(i):
+                              torch.cuda.empty_cache()
+                              torch.cuda.synchronize()
+                              x = torch.randn(8, 8, device=f"cuda:{i}")
+                              x = x @ x
+                              torch.cuda.synchronize()
+                              props = torch.cuda.get_device_properties(i)
+                              gpu_mem_total = props.total_memory / 1024**3
+                              cap_major, cap_minor = props.major, props.minor
+                              print(f"  - Device Name:         {device_name}")
+                              print(f"  - Total Memory (GB):   {gpu_mem_total:.2f}")
+                              print(f"  - Compute Capability:  {cap_major}.{cap_minor}")
+                              if hasattr(torch.cuda, 'driver_version'):
+                                  print(f"  - Driver Version (PyTorch): {torch.cuda.driver_version()}")
+                              available_gpus.append(i)
+                      except Exception as e:
+                          print(f"  - Error encountered: {e}")
+                          unavailable_gpus.append(i)
+                  return available_gpus, unavailable_gpus
+
+              def gpu_stats(device_id):
+                  memory_allocated = torch.cuda.memory_allocated(device_id) / 1024**3
+                  memory_reserved = torch.cuda.memory_reserved(device_id) / 1024**3
+                  power_usage = None
+                  temperature = None
+                  try:
+                      power_usage = torch.cuda._C._cuda_get_power_usage(device_id) / 1000
+                      temperature = torch.cuda._C._cuda_get_temperature(device_id)
+                  except AttributeError:
+                      pass
+                  return {
+                      'Memory Allocated (GB)': memory_allocated,
+                      'Memory Reserved (GB)': memory_reserved,
+                      'Power Usage (W)': power_usage,
+                      'Temperature (C)': temperature
+                  }
+
+              def get_test_params():
+                  size = os.environ.get("TEST_SIZE", "small").lower()
+                  if size == "medium":
+                      return {
+                          "matmul_size": 8192,
+                          "matmul_iter": 20,
+                          "cnn_batch": 128,
+                          "cnn_batches": 200,
+                          "cnn_epochs": 3
+                      }
+                  elif size == "large":
+                      return {
+                          "matmul_size": 16384,
+                          "matmul_iter": 50,
+                          "cnn_batch": 256,
+                          "cnn_batches": 500,
+                          "cnn_epochs": 5
+                      }
+                  elif size == "xlarge":
+                      return {
+                          "matmul_size": 32768,
+                          "matmul_iter": 100,
+                          "cnn_batch": 512,
+                          "cnn_batches": 1000,
+                          "cnn_epochs": 10
+                      }
+                  else:
+                      return {
+                          "matmul_size": 4096,
+                          "matmul_iter": 10,
+                          "cnn_batch": 64,
+                          "cnn_batches": 50,
+                          "cnn_epochs": 2
+                      }
+
+              def run_mixed_precision_test(gpu, matrix_size=4096, iterations=10):
+                  device = torch.device(f"cuda:{gpu}")
+                  props = torch.cuda.get_device_properties(gpu)
+                  cap_major, cap_minor = props.major, props.minor
+                  if not hasattr(torch.cuda.amp, 'autocast'):
+                      print(f"PyTorch AMP not supported on this version, skipping mixed precision test.")
+                      return
+                  if cap_major < 7:
+                      print(f"GPU {gpu} has compute capability {cap_major}.{cap_minor}, < 7.0.")
+                      print("Mixed precision is not fully supported. Skipping this test.")
+                      return
+                  stats_before = gpu_stats(gpu)
+                  print(f"\n=== Mixed Precision Test (GPU {gpu}) ===")
+                  print(f"Matrix size: {matrix_size}x{matrix_size}, Iterations: {iterations}")
+                  mat1 = torch.randn((matrix_size, matrix_size), device=device, dtype=torch.float16)
+                  mat2 = torch.randn((matrix_size, matrix_size), device=device, dtype=torch.float16)
+                  iteration_times = []
+                  for i in range(iterations):
+                      start = time.time()
+                      with torch.cuda.amp.autocast():
+                          out = torch.matmul(mat1, mat2)
+                      torch.cuda.synchronize(device)
+                      iteration_times.append(time.time() - start)
+                  stats_after = gpu_stats(gpu)
+                  avg_time = sum(iteration_times) / iterations
+                  variance = sum((t - avg_time) ** 2 for t in iteration_times) / iterations
+                  std_dev = math.sqrt(variance)
+                  print(f"Mixed Precision matmul completed on GPU {gpu}.")
+                  print(f"Average time per iteration: {avg_time:.6f} s")
+                  print(f"Std Dev: {std_dev:.6f} s")
+                  print(f"GPU {gpu}: Temp before: {stats_before['Temperature (C)']}, after: {stats_after['Temperature (C)']}")
+
+              def run_matmul_benchmark(gpus, matrix_size=4096, num_iterations=10):
+                  if not gpus:
+                      print("No GPUs available for matrix multiplication benchmark.")
+                      return
+                  results = []
+                  print(f"\n=== Matrix Multiplication Benchmark (FP32) ===")
+                  print(f"Matrix size: {matrix_size}x{matrix_size}")
+                  print(f"Number of iterations per GPU: {num_iterations}")
+                  for i in gpus:
+                      device = torch.device(f"cuda:{i}")
+                      gpu_name = torch.cuda.get_device_name(i)
+                      print(f"\nRunning matmul benchmark on GPU {i}: {gpu_name}")
+                      mat1 = torch.randn((matrix_size, matrix_size), device=device, dtype=torch.float32)
+                      mat2 = torch.randn((matrix_size, matrix_size), device=device, dtype=torch.float32)
+                      _ = torch.matmul(mat1, mat2)
+                      torch.cuda.synchronize(device)
+                      iteration_times = []
+                      stats_before = gpu_stats(i)
+                      for iteration in range(num_iterations):
+                          start_time = time.time()
+                          _ = torch.matmul(mat1, mat2)
+                          torch.cuda.synchronize(device)
+                          end_time = time.time()
+                          elapsed = end_time - start_time
+                          iteration_times.append(elapsed)
+                          print(f"  Iteration {iteration+1}/{num_iterations} time: {elapsed:.6f} seconds")
+                      stats_after = gpu_stats(i)
+                      avg_time = sum(iteration_times) / len(iteration_times)
+                      variance = sum((t - avg_time) ** 2 for t in iteration_times) / len(iteration_times)
+                      std_dev = math.sqrt(variance)
+                      print(f"  Average Time (s): {avg_time:.6f}")
+                      print(f"  Std Dev (s):      {std_dev:.6f}")
+                      print(f"GPU {i}: Temp before: {stats_before['Temperature (C)']}, after: {stats_after['Temperature (C)']}")
+                      result = {
+                          'Test Type': 'MatrixMultiplication',
+                          'GPU Index': i,
+                          'GPU Name': gpu_name,
+                          'Matrix Size': matrix_size,
+                          'Iterations': num_iterations,
+                          'Average Elapsed (s)': avg_time,
+                          'Std Dev (s)': std_dev,
+                          'Memory Allocated Before (GB)': stats_before['Memory Allocated (GB)'],
+                          'Memory Reserved Before (GB)': stats_before['Memory Reserved (GB)'],
+                          'Power Usage Before (W)': stats_before['Power Usage (W)'],
+                          'Temperature Before (C)': stats_before['Temperature (C)'],
+                          'Memory Allocated After (GB)': stats_after['Memory Allocated (GB)'],
+                          'Memory Reserved After (GB)': stats_after['Memory Reserved (GB)'],
+                          'Power Usage After (W)': stats_after['Power Usage (W)'],
+                          'Temperature After (C)': stats_after['Temperature (C)'],
+                      }
+                      results.append(result)
+                  save_results_csv(results, suffix="matmul")
+
+              class SimpleCNN(nn.Module):
+                  def __init__(self, num_classes=10):
+                      super(SimpleCNN, self).__init__()
+                      self.layer1 = nn.Sequential(
+                          nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+                          nn.ReLU(),
+                          nn.MaxPool2d(kernel_size=2, stride=2)
+                      )
+                      self.layer2 = nn.Sequential(
+                          nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+                          nn.ReLU(),
+                          nn.MaxPool2d(kernel_size=2, stride=2)
+                      )
+                      self.fc = nn.Linear(32 * 8 * 8, num_classes)
+
+                  def forward(self, x):
+                      x = self.layer1(x)
+                      x = self.layer2(x)
+                      x = x.view(x.size(0), -1)
+                      x = self.fc(x)
+                      return x
+
+              def run_cnn_benchmark(gpus, image_size=32, num_channels=3, num_classes=10, batch_size=64, num_batches=50, epochs=2):
+                  if not gpus:
+                      print("No GPUs available for CNN benchmark.")
+                      return
+                  results = []
+                  print(f"\n=== CNN Training Benchmark ===")
+                  print(f"Image Size: {image_size}x{image_size}, Channels: {num_channels}, Classes: {num_classes}")
+                  print(f"Batch Size: {batch_size}, Batches per Epoch: {num_batches}, Epochs: {epochs}")
+                  for i in gpus:
+                      device = torch.device(f"cuda:{i}")
+                      gpu_name = torch.cuda.get_device_name(i)
+                      print(f"\nRunning CNN benchmark on GPU {i}: {gpu_name}")
+                      model = SimpleCNN(num_classes=num_classes).to(device)
+                      criterion = nn.CrossEntropyLoss()
+                      optimizer = optim.SGD(model.parameters(), lr=0.01)
+                      data = torch.randn((batch_size, num_channels, image_size, image_size), device=device)
+                      labels = torch.randint(0, num_classes, (batch_size,), device=device)
+                      stats_before = gpu_stats(i)
+                      epoch_times = []
+                      for epoch in range(epochs):
+                          start_epoch = time.time()
+                          for _ in range(num_batches):
+                              optimizer.zero_grad()
+                              outputs = model(data)
+                              loss = criterion(outputs, labels)
+                              loss.backward()
+                              optimizer.step()
+                          torch.cuda.synchronize(device)
+                          end_epoch = time.time()
+                          epoch_time = end_epoch - start_epoch
+                          epoch_times.append(epoch_time)
+                          print(f"  Epoch {epoch+1}/{epochs} time: {epoch_time:.6f} seconds")
+                      stats_after = gpu_stats(i)
+                      avg_time = sum(epoch_times) / len(epoch_times)
+                      variance = sum((t - avg_time) ** 2 for t in epoch_times) / len(epoch_times)
+                      std_dev = math.sqrt(variance)
+                      print(f"  Average Epoch Time (s): {avg_time:.6f}")
+                      print(f"  Std Dev (s):            {std_dev:.6f}")
+                      print(f"GPU {i}: Temp before: {stats_before['Temperature (C)']}, after: {stats_after['Temperature (C)']}")
+                      result = {
+                          'Test Type': 'CNNTraining',
+                          'GPU Index': i,
+                          'GPU Name': gpu_name,
+                          'Image Size': image_size,
+                          'Batch Size': batch_size,
+                          'Batches per Epoch': num_batches,
+                          'Epochs': epochs,
+                          'Average Epoch Time (s)': avg_time,
+                          'Std Dev (s)': std_dev,
+                          'Memory Allocated Before (GB)': stats_before['Memory Allocated (GB)'],
+                          'Memory Reserved Before (GB)': stats_before['Memory Reserved (GB)'],
+                          'Power Usage Before (W)': stats_before['Power Usage (W)'],
+                          'Temperature Before (C)': stats_before['Temperature (C)'],
+                          'Memory Allocated After (GB)': stats_after['Memory Allocated (GB)'],
+                          'Memory Reserved After (GB)': stats_after['Memory Reserved (GB)'],
+                          'Power Usage After (W)': stats_after['Power Usage (W)'],
+                          'Temperature After (C)': stats_after['Temperature (C)'],
+                      }
+                      results.append(result)
+                  save_results_csv(results, suffix="cnn")
+
+              def save_results_csv(results, suffix=""):
+                  if not results:
+                      print(f"No results found for {suffix} benchmark.")
+                      return
+                  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                  filename = f'gpu_benchmark_results_{suffix}_{timestamp}.csv'
+                  with open(filename, mode='w', newline='') as file:
+                      fieldnames = list(results[0].keys())
+                      writer = csv.DictWriter(file, fieldnames=fieldnames)
+                      writer.writeheader()
+                      writer.writerows(results)
+                  print(f"\nBenchmark results saved to {filename}")
+
+              if __name__ == "__main__":
+                  print_kubernetes_info()
+                  print_system_info()
+                  check_nvidia_smi()
+                  available_gpus, unavailable_gpus = check_gpus()
+                  print("\n=== Summary of GPU Checks ===")
+                  print(f"Available GPUs:   {available_gpus}")
+                  print(f"Unavailable GPUs: {unavailable_gpus}")
+                  if available_gpus:
+                      params = get_test_params()
+                      for gpu in available_gpus:
+                          run_mixed_precision_test(gpu, matrix_size=params["matmul_size"], iterations=params["matmul_iter"])
+                      run_matmul_benchmark(gpus=available_gpus, matrix_size=params["matmul_size"], num_iterations=params["matmul_iter"])
+                      run_cnn_benchmark(
+                          gpus=available_gpus,
+                          image_size=32,
+                          num_channels=3,
+                          num_classes=10,
+                          batch_size=params["cnn_batch"],
+                          num_batches=params["cnn_batches"],
+                          epochs=params["cnn_epochs"]
+                      )
+                  else:
+                      print("No GPUs available for benchmarking.")
+              EOF
+
+              echo "Created /tmp/gpu_benchmark.py. Now running it..."
+              python /tmp/gpu_benchmark.py
+
+              # Keep the container alive after the benchmark completes to prevent restarts
+              echo "Benchmark completed. Keeping the container alive."
+              tail -f /dev/null
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: TEST_SIZE
+              value: "small" # Set to "medium", "large", or "xlarge" for larger test sizes
+
