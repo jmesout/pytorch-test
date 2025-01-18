@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-diagnostic-daemonset
+  labels:
+    app: dcgm-diagnostic
+spec:
+  selector:
+    matchLabels:
+      app: dcgm-diagnostic
+  template:
+    metadata:
+      labels:
+        app: dcgm-diagnostic
+    spec:
+      restartPolicy: Always  # DaemonSet requires restartPolicy to be Always
+      containers:
+        - name: dcgm-diag
+          image: nvidia/cuda:12.0.1-devel-ubuntu22.04
+          env:
+            - name: DCGM_DIAG_SIZE
+              value: "medium"  # Possible values: small, medium, large, xlarge
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              # Map the DCGM_DIAG_SIZE to a diagnostic level
+              case "$DCGM_DIAG_SIZE" in
+                small|SMALL)
+                  diag_level=1  # quick test
+                  ;;
+                medium|MEDIUM)
+                  diag_level=2  # short test
+                  ;;
+                large|LARGE)
+                  diag_level=3  # medium test
+                  ;;
+                xlarge|XLARGE)
+                  diag_level=4  # long test
+                  ;;
+                *)
+                  echo "Invalid DCGM_DIAG_SIZE: $DCGM_DIAG_SIZE -- defaulting to 'medium' (short test)."
+                  diag_level=2
+                  ;;
+              esac
+
+              echo "== Installing DCGM in the container =="
+              apt-get update && apt-get install -y datacenter-gpu-manager
+
+              echo "== GPU Info with nvidia-smi =="
+              nvidia-smi
+
+              echo "== Running DCGM diagnostic at level $diag_level =="
+              dcgmi diag -r "$diag_level"
+
+              echo "== DCGM Diagnostics Complete =="
+
+              # Keep the container alive after the diagnostic completes to prevent restarts
+              echo "Diagnostic completed successfully. Keeping the container alive."
+              tail -f /dev/null
+
