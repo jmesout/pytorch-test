@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ddp-benchmark-daemonset
+  labels:
+    app: ddp-benchmark
+spec:
+  selector:
+    matchLabels:
+      app: ddp-benchmark
+  template:
+    metadata:
+      labels:
+        app: ddp-benchmark
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: ddp-benchmark-container
+          image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              # Write your script to /tmp/gpu_benchmark.py
+              cat << 'EOF' > /tmp/gpu_benchmark.py
+              import os
+              import torch
+              import torch.nn as nn
+              import torch.optim as optim
+              import torchvision.models as models
+              from torch.utils.data import DataLoader
+              from torchvision import datasets, transforms
+              from torch.nn.parallel import DistributedDataParallel as DDP
+              from PIL import Image
+              import numpy as np
+
+              def generate_dummy_data_if_empty(root="/data", num_classes=2, num_images=20):
+                  if not os.path.exists(root):
+                      os.makedirs(root)
+                  if any(os.scandir(root)):
+                      print(f"[INFO] {root} is not empty. Skipping dummy data generation.")
+                      return
+                  print(f"[INFO] {root} is empty. Generating {num_classes} classes, {num_images} images per class.")
+                  for c in range(num_classes):
+                      class_dir = os.path.join(root, f"class_{c}")
+                      os.makedirs(class_dir, exist_ok=True)
+                      for i in range(num_images):
+                          img_array = (np.random.rand(224, 224, 3) * 255).astype(np.uint8)
+                          img = Image.fromarray(img_array)
+                          img.save(os.path.join(class_dir, f"img_{i}.jpg"))
+
+              def main():
+                  torch.distributed.init_process_group(backend='nccl')
+                  local_rank = int(os.environ.get('LOCAL_RANK', 0))
+                  torch.cuda.set_device(local_rank)
+                  device = torch.device('cuda', local_rank)
+
+                  generate_dummy_data_if_empty(root="/data", num_classes=2, num_images=20)
+
+                  model = models.resnet18(pretrained=True)
+                  model = model.to(device)
+                  model = DDP(model, device_ids=[local_rank])
+
+                  transform = transforms.Compose([
+                      transforms.Resize(256),
+                      transforms.CenterCrop(224),
+                      transforms.ToTensor(),
+                      transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                           std=[0.229, 0.224, 0.225]),
+                  ])
+                  dataset = datasets.ImageFolder(root='/data', transform=transform)
+                  sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+                  dataloader = DataLoader(dataset, batch_size=32, sampler=sampler)
+
+                  criterion = nn.CrossEntropyLoss().to(device)
+                  optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+
+                  model.train()
+                  num_epochs = 10
+                  for epoch in range(num_epochs):
+                      sampler.set_epoch(epoch)
+                      running_loss = 0.0
+                      for inputs, labels in dataloader:
+                          inputs, labels = inputs.to(device), labels.to(device)
+                          optimizer.zero_grad()
+                          outputs = model(inputs)
+                          loss = criterion(outputs, labels)
+                          loss.backward()
+                          optimizer.step()
+                          running_loss += loss.item()
+                      if torch.distributed.get_rank() == 0:
+                          print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss / len(dataloader):.4f}")
+
+                  torch.distributed.destroy_process_group()
+
+              if __name__ == '__main__':
+                  main()
+              EOF
+
+              echo "Starting DDP training via torchrun..."
+              # Single-node, single-GPU example:
+              torchrun --nproc_per_node=1 /tmp/gpu_benchmark.py
+
+              echo "Training completed. Keeping the container alive..."
+              tail -f /dev/null
+
+          # If you're doing single-node, it's okay to keep these as 1, 0, etc.
+          # For multi-node, you'd need MASTER_ADDR, MASTER_PORT, WORLD_SIZE, NODE_RANK, etc.
+          env:
+            - name: MASTER_ADDR
+              value: "127.0.0.1"
+            - name: MASTER_PORT
+              value: "29500"
+            - name: WORLD_SIZE
+              value: "1"
+            - name: NODE_RANK
+              value: "0"
+            # LOCAL_RANK is set automatically by torchrun
