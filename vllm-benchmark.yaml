@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-benchmark-pod
+spec:
+  restartPolicy: Never
+  containers:
+    - name: vllm-benchmark-container
+      image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+      env:
+        - name: BENCHMARK_BACKEND
+          value: "openai"
+        - name: BENCHMARK_BASE_URL
+          value: "http://127.0.0.1:8080"
+        - name: BENCHMARK_DATASET_NAME
+          value: "random"
+        - name: BENCHMARK_MODEL
+          value: "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
+        - name: BENCHMARK_SEED
+          value: "12345"
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -ex
+          # Clone vLLM repository and check out the specified commit.
+          git clone https://github.com/vllm-project/vllm.git
+          cd vllm
+          git checkout 16a1cc9bb2b4bba82d78f329e5a89b44a5523ac8
+          cd benchmarks
+          # Run the benchmark, reading configuration from environment variables.
+          python3 benchmark_serving.py \
+            --backend ${BENCHMARK_BACKEND} \
+            --base-url ${BENCHMARK_BASE_URL} \
+            --dataset-name ${BENCHMARK_DATASET_NAME} \
+            --model ${BENCHMARK_MODEL} \
+            --seed ${BENCHMARK_SEED} \
+            --save-result
